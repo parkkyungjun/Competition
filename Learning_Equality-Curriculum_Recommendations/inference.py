@@ -22,8 +22,8 @@ str_kf = StratifiedKFold(n_splits = 10, shuffle = True, random_state = 8746)
 
 for train_index, test_index in str_kf.split(correlations, [0]*len(correlations)):
     X_train, X_test = correlations.iloc[train_index], correlations.iloc[test_index]
-    correlations = X_train
-    corr_t = X_test
+    _ = X_train
+    correlations = X_test
     del X_train, X_test
     break
     
@@ -42,7 +42,7 @@ for i in range(len(content)):
     l.append(t)
 corr['topic'] = [str(i) + '[SEP]' + str(j) if str(j) != 'nan' else i for i,j in zip(corr['topic_title'].values, corr['topic_description'].values)]
 content['content'] = l
-del l, t, topics, correlations
+del l, t, topics
 corr['value'] = 1
 corr = corr[['topic_id', 'content_ids', 'topic','value']]
 content = content[['content_id', 'content']]
@@ -141,8 +141,7 @@ p = []
 t = []
 for k in range(len(indices)):
     pred = indices[k]
-    l = corr.loc[k, 'content_ids'].split(' ')
-    prediction = [content.loc[ind, 'content_id'] for ind in pred if content.loc[ind, 'content_id'] not in l]
+    prediction = [content.loc[ind, 'content_id'] for ind in pred]
     p += prediction
     t += [corr.loc[k, 'topic_id']] * len(prediction)
     
@@ -152,21 +151,21 @@ corr["content_id"] = corr["content_ids"].str.split(" ")
 corr = corr.explode("content_id").drop(columns=["content_ids"])
 
 corr = pd.concat([corr,neg])
-del l, neg, p, t, prediction
+del neg, p, t, prediction
 corr = corr.merge(content, how="left", on="content_id")
 corr = corr[['topic_id', 'content_id', 'topic', 'content', 'value']]
 del content
 corr = corr.sort_values(by='topic_id' ,ascending=True).reset_index(drop=True)
 
-correlations = pd.read_csv(DATA_PATH + "correlations.csv")
+correlations2 = pd.read_csv(DATA_PATH + "correlations.csv")
 topics = pd.read_csv(DATA_PATH + "topics.csv")
 
 topics.rename(columns=lambda x: "topic_" + x, inplace=True)
 
-corr2 = correlations.merge(topics, how="left", on="topic_id")
+corr2 = correlations2.merge(topics, how="left", on="topic_id")
 corr2['topic'] = [str(i) + '[SEP]' + str(j) if str(j) != 'nan' else i for i,j in zip(corr2['topic_title'].values, corr2['topic_description'].values)]
 corr2 = corr2[['topic_id', 'topic']]
-del correlations, topics
+del correlations2, topics
 corr = corr[['topic_id', 'content_id', 'content', 'value']]
 corr = corr.merge(corr2, how="left", on="topic_id")
 del corr2
@@ -189,7 +188,7 @@ class s2_datset(Dataset):
 
 print('make train dataset...')
 train_dataset = s2_datset(corr)
-train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=384)
+train_dataloader = DataLoader(train_dataset, shuffle=False, batch_size=384)
 # 0 : max_pos_top-50: 0.45608
 # 1 : max_pos_top-50: 0.43154
 # 20 : 0.51276
@@ -222,66 +221,46 @@ class stage2(nn.Module):
             module.weight.data.fill_(1.0)
         if isinstance(module, nn.Linear) and module.bias is not None:
             module.bias.data.zero_()
-            
+
+
+def f2_score(true_ids, pred_ids):
+    true_positives = len(set(true_ids)&set(pred_ids))
+    false_positives = len(set(pred_ids)-set(true_ids))
+    false_negatives = len(set(true_ids)-set(pred_ids))
+
+    beta = 2
+    f2_score = ((1+beta**2)*true_positives)/((1+beta**2)*true_positives + beta**2*false_negatives + false_positives)
+    return fbeta_score(y_true, y_pred, beta=2, average='samples')
+
 # Instantiate stage2 model
 model = stage2(model)
 #model.load_state_dict(torch.load('3epochs_stage2.pt'))
 model.load_state_dict(torch.load('3epochs_stage2_Frozen.pt'))
 model.to(device)
-
-def validation(model, df):
-    topics = pd.read_csv(DATA_PATH + "topics.csv")
-    content = pd.read_csv(DATA_PATH + "content.csv")
-
-    topics.rename(columns=lambda x: "topic_" + x, inplace=True)
-    content.rename(columns=lambda x: "content_" + x, inplace=True)
-    l = []
-    for i in range(len(content)):
-        t = str(content['content_title'].values[i])
-        if str(content['content_description'].values[i]) != 'nan':
-            t += '[SEP]' + str(content['content_description'].values[i])
-        if str(str(content['content_text'].values[i])) != 'nan':
-            t += '[SEP]' + str(content['content_text'].values[i])
-        l.append(t)
-
-    content['content'] = l
-    content = content[['content_id', 'content']]
-    topics['topic'] = [str(i) + '[SEP]' + str(j) if str(j) != 'nan' else i for i,j in zip(topics['topic_title'].values, topics['topic_description'].values)]
-    topics = topics[['topic_id', 'topic']]
+model.eval()
+threshold = 0.001
+correlations = correlations.sort_values(by='topic_id' ,ascending=False)
+for k in tqdm(range(999)):
+    find = np.numpy()
     
-    df = df.merge(topics, how="left", on="topic_id")
-    # df = df.merge(content, how="left", on="content_id")
-
-    topics_dataset = uns_dataset2(df, 'topic')
-
-    topics_loader = DataLoader(
-        topics_dataset, 
-        batch_size = 32, 
-        shuffle = False, 
- #       collate_fn = DataCollatorWithPadding(tokenizer = cfg.tokenizer, padding = 'longest'),
-        num_workers = 4, 
-        pin_memory = True, 
-        drop_last = False
-    )
-
-    model.to(device)
-    # Predict topics
-    topics_preds = get_embeddings2(topics_loader, model, device)
-    # Transfer predictions to gpu
-    topics_preds_gpu = cp.array(topics_preds)
-    # Release memory
-    del topics_dataset, topics_loader, topics_preds
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    topics_preds_gpu = cp.float32(topics_preds_gpu.get())
-    indices = neighbors_model.kneighbors(topics_preds_gpu, return_distance = False)
-
-    predictions = []
-
-    for k in range(len(indices)):
-        pred = indices[k]
-        p = ' '.join([content.loc[ind, 'content_id'] for ind in pred])
-        predictions.append(p)
-
-    print('max_pos_top-50: ' + str(get_pos_score(df['content_ids'], predictions)))
+    for text, _ in train_dataloader:
+        output = model(text).unsqueeze().detach().cpu().numpy()
+        find = np.concatenate(find, output)
+    corr['out'] = find
+    temp = corr[corr['out'] >= threshold]
+    temp = temp.groupby('topic_id').agg({'content_id': ' '.join}).reset_index()
+    temp = temp.sort_values(by='topic_id' ,ascending=False)
+    if k == 0:
+        if all([t==c for t, c in zip(temp['topic_id'], correlations['topic_id'])]) == False:
+            print(len(temp), len(correlations))
+            break
+        else:
+            print('good')
+    avg = 0
+    for i in range(len(temp)):
+        avg += f2_score(list(correlations.loc[i, 'content_ids']), list(temp.loc[i, 'content_id']))
+    val = avg/len(temp)
+    if val > befo:
+        print(threshold, val)
+        befo = val
+    threshold += 0.001 
