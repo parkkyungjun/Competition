@@ -241,11 +241,11 @@ model.eval()
 threshold = 0.001
 correlations = correlations.sort_values(by='topic_id' ,ascending=False)
 for k in tqdm(range(999)):
-    find = np.numpy()
+    find = np.numpy([])
     
     for text, _ in train_dataloader:
         output = model(text).unsqueeze().detach().cpu().numpy()
-        find = np.concatenate(find, output)
+        find = np.concatenate((find, output))
     corr['out'] = find
     temp = corr[corr['out'] >= threshold]
     temp = temp.groupby('topic_id').agg({'content_id': ' '.join}).reset_index()
