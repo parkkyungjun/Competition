@@ -190,7 +190,6 @@ class s2_datset(Dataset):
 print('make train dataset...')
 train_dataset = s2_datset(corr)
 train_dataloader = DataLoader(train_dataset, shuffle=True, batch_size=384)
-train_loss = nn.BCEWithLogitsLoss()
 # 0 : max_pos_top-50: 0.45608
 # 1 : max_pos_top-50: 0.43154
 # 20 : 0.51276
@@ -211,6 +210,19 @@ class stage2(nn.Module):
         encoded = self.model.encode(x)
         return self.bc(torch.tensor(encoded).to(device))
 
+    def init_weights(self, module):
+        """ Initialize the weights.
+        """
+        if isinstance(module, (nn.Linear, nn.Embedding)):
+            # Slightly different from the TF version which uses truncated_normal for initialization
+            # cf https://github.com/pytorch/pytorch/pull/5617
+            module.weight.data.normal_(mean=0.0, std=self.args.initializer_range)
+        elif isinstance(module, LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+        if isinstance(module, nn.Linear) and module.bias is not None:
+            module.bias.data.zero_()
+            
 # Instantiate stage2 model
 model = stage2(model)
 #model.load_state_dict(torch.load('3epochs_stage2.pt'))
