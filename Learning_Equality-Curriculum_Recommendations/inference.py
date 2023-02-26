@@ -241,7 +241,7 @@ model.eval()
 threshold = 0.001
 correlations = correlations.sort_values(by='topic_id' ,ascending=False)
 for k in tqdm(range(999)):
-    find = np.numpy([])
+    find = np.array([])
     
     for text, _ in train_dataloader:
         output = model(text).unsqueeze().detach().cpu().numpy()
