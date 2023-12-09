@@ -8,6 +8,7 @@ import optuna
 # stratified_kfold = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
 """
 lgbm
+https://lightgbm.readthedocs.io/en/latest/Parameters.html
 param = { num_iterations, eta
     'max_depth': sp_randint(15, 30), # -1, x>=0
     'colsample_bytree': sp_uniform(0.5, 0.5), # 1, 0~1
@@ -18,6 +19,7 @@ param = { num_iterations, eta
     'max_bin': sp_randint(150, 1500), # 255, x>=1
 }
 xgb
+https://xgboost.readthedocs.io/en/stable/parameter.html
 param = { n_estimators, eta
     'max_depth': trial.suggest_int('max_depth', 3, 10), # 6, x>=0
     'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0), # 1, 0~1
