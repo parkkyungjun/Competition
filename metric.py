@@ -42,3 +42,8 @@ def average_precision(label, pred):
 
 def macro_f1_score(y_true, y_pred, n_classes):
     return np.mean([f1_score((y_true == c), (y_pred == c)) for c in range(n_classes)])
+
+def auc(y_true, y_pred):
+    return roc_auc_score(y_true, y_pred)
+
+
