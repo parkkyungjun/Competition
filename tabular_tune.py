@@ -9,7 +9,7 @@ import optuna
 """
 lgbm
 https://lightgbm.readthedocs.io/en/latest/Parameters.html
-param = { num_iterations, eta
+param = { num_iterations
     'max_depth': sp_randint(15, 30), # -1, x>=0
     'colsample_bytree': sp_uniform(0.5, 0.5), # 1, 0~1
     'colsample_bynode': sp_uniform(0.5, 0.5), # 1, 0~1
@@ -18,14 +18,23 @@ param = { num_iterations, eta
     'min_child_samples' : sp_randint(10, 150), # 20, x>=0
     'max_bin': sp_randint(150, 1500), # 255, x>=1
 }
+
 xgb
 https://xgboost.readthedocs.io/en/stable/parameter.html
-param = { n_estimators, eta
+param = { n_estimators, 
     'max_depth': trial.suggest_int('max_depth', 3, 10), # 6, x>=0
     'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1.0), # 1, 0~1
     'reg_alpha': trial.suggest_float('alpha', 0, 1), # 0, x>=0
     'reg_lambda': trial.suggest_float('lambda', 1, 10), # 1, x>=0
     'min_child_weight': trial.suggest_int('min_child_weight', 1, 10), # 1, x>=0
+}
+
+cat
+https://catboost.ai/en/docs/references/training-parameters/
+param = { n_estimators
+    'max_depth': trial.suggest_int('max_depth', 3, 10), # 6, x>=0
+    'reg_lambda': trial.suggest_float('lambda', 1, 10), # 3, x>=0
+    'min_child_samples': trial.suggest_int('min_child_samples', 1, 10), # 1 x>=0
 }
 """
 def log_best(serch):
@@ -85,7 +94,7 @@ def optuna(objective, direction, n_trials):
   """
 
   
-  study = optuna.create_study(direction=direction')
+  study = optuna.create_study(direction=direction)
   study.optimize(objective, n_trials=n_trials)
   
   print("Best parameters: ", study.best_trial.params)
