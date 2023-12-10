@@ -69,7 +69,7 @@ def bayes_search(X_train, y_train, model, param, serch_param):
   bayes_search.fit(X_train, y_train)
   log_best(bayes_search)
 
-def optuna(X_train, y_train, objective, direction, n_trials):
+def optuna(objective, direction, n_trials):
   """
   def objective(trial):
       param = {
