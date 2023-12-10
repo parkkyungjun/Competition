@@ -28,8 +28,8 @@ class model():
     
     for train_index, test_index in kfold.split(X):
       if isinstance(X, pd.DataFrame):
-        X_train, X_test = X.loc[train_index], X.loc[test_index] 
-        y_train, y_test = y.loc[train_index], y.loc[test_index]
+        X_train, X_test = X.iloc[train_index], X.iloc[test_index] 
+        y_train, y_test = y.iloc[train_index], y.iloc[test_index]
       elif isinstance(X, np.array):
         X_train, X_test = X[train_index], X[test_index]
         y_train, y_test = y[train_index], y[test_index]
