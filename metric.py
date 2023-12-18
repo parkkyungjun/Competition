@@ -1,3 +1,8 @@
+import pandas as pd
+import numpy as np
+
+from sklearn.metrics import balanced_accuracy_score
+
 def average_precision(label, pred):
     label = label.dropna()[['series_id','event','step']].reset_index(drop=True)
     pred = pred.sort_values(['score'], ascending=False)[['series_id','event','step', 'score']].reset_index(drop=True)
@@ -46,4 +51,5 @@ def macro_f1_score(y_true, y_pred, n_classes):
 def auc(y_true, y_pred):
     return roc_auc_score(y_true, y_pred)
 
-
+def avg_precision(y_true, y_pred):
+    return balanced_accuracy_score(y_true, y_pred)
