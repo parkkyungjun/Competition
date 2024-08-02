@@ -1,0 +1,18 @@
+FROM llama3.1
+
+TEMPLATE """{{- if .System }}
+<s>{{ .System }}</s>
+{{- end }}
+<s>Human: 문서: {{ .Context }}
+
+질문: {{ .Prompt }}</s>
+<s>Assistant:
+"""
+
+SYSTEM """당신은 사용자의 질문에 대해 제공된 문서 내용을 바탕으로 정확하고 관련성 높은 답변을 제공하는 AI 어시스턴트입니다. 문서에 명시된 정보만을 사용하여 답변해야 합니다."""
+
+PARAMETER temperature 0
+PARAMETER num_predict 2000
+PARAMETER num_ctx 4096
+PARAMETER stop <s>
+PARAMETER stop </s>
