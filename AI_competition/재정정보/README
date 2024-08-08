@@ -1,0 +1,7 @@
+ollama serve
+
+ollama pull llama3.1 or ollama pull llama3.1:70b
+
+
+python infer.py
+python valid.py
