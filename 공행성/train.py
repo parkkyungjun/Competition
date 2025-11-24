@@ -11,20 +11,19 @@ warnings.filterwarnings("ignore")
 # [설정] 이 값들을 조절해서 실험해보세요
 # ==========================================
 DATA_PATH = 'train.csv'
-MAX_LAG = 6           # 최대 6개월 전 데이터까지 확인
+MAX_LAG = 12           # 최대 6개월 전 데이터까지 확인
 DUMMY_VALUE = 9999999999 # 예측을 일부러 틀리기 위한 큰 값
 
 # 실험별 기준값 (Threshold)
 PEARSON_THR = 0.4     # 상관계수 0.7 이상이면 짝꿍
 SPEARMAN_THR = 0.7    # 상관계수 0.7 이상이면 짝꿍
-GRANGER_P_VAL = 0.05  # P-value 0.05 미만이면 짝꿍 (유의수준 5%)
+GRANGER_P_VAL = 0.01  # P-value 0.05 미만이면 짝꿍 (유의수준 5%)
 # ==========================================
 
 def load_and_preprocess(path):
     """데이터 불러오기 및 피벗 테이블 생성"""
     print("📂 데이터 로딩 중...")
     df = pd.read_csv(path)
-    df = df[df['value'] != 0]
     
     # 월별 합계 계산
     df_grouped = df.groupby(['item_id', 'year', 'month'])['value'].sum().reset_index()
@@ -35,7 +34,71 @@ def load_and_preprocess(path):
     # 피벗 (행: 날짜, 열: 아이템, 값: 무역량)
     pivot_df = df_grouped.pivot(index='date', columns='item_id', values='value').fillna(0)
     print(f"✅ 데이터 준비 완료. (총 {len(pivot_df.columns)}개 품목)")
+    # analyze_zero_counts(pivot_df)
     return pivot_df
+
+def analyze_zero_counts(pivot_df):
+    # 1. 각 아이템(컬럼)별 0의 개수 계산
+    zero_counts = (pivot_df == 0).sum()
+    
+    # 2. 전체 데이터 길이 대비 0의 비율 (Sparsity 확인용)
+    zero_ratios = (zero_counts / len(pivot_df)) * 100
+    
+    # 3. 데이터프레임으로 합쳐서 보기 좋게 정렬 (0이 많은 순서)
+    analysis_df = pd.DataFrame({
+        'zero_count': zero_counts,
+        'zero_ratio (%)': zero_ratios
+    }).sort_values(by='zero_count', ascending=False)
+    
+    print("📊 아이템별 0 값(결측치 포함) 통계:")
+    print(analysis_df)
+    analysis_df.to_csv('spase.csv')
+    return analysis_df
+
+# def load_and_preprocess(path, apply_log=True, apply_diff=True):
+#     """
+#     데이터 불러오기 및 전처리 (로그 변환 + 차분)
+#     apply_log: 값의 스케일을 줄여 아웃라이어 영향 감소
+#     apply_diff: 추세를 제거하여 정상성(Stationarity) 확보 (Granger 필수)
+#     """
+#     print("📂 데이터 로딩 중...")
+#     df = pd.read_csv(path)
+    
+#     # 월별 합계 계산
+#     df_grouped = df.groupby(['item_id', 'year', 'month'])['value'].sum().reset_index()
+    
+#     # 날짜 인덱스 생성
+#     df_grouped['date'] = pd.to_datetime(df_grouped[['year', 'month']].assign(day=1))
+    
+#     # 피벗 (행: 날짜, 열: 아이템, 값: 무역량)
+#     pivot_df = df_grouped.pivot(index='date', columns='item_id', values='value').fillna(0)
+    
+#     print(f"📊 원본 데이터: {pivot_df.shape}")
+
+#     # -------------------------------------------------------
+#     # [전처리 1] 로그 변환 (Outlier 완화)
+#     # -------------------------------------------------------
+#     if apply_log:
+#         print("🔧 [전처리] 로그 변환 적용 (np.log1p)")
+#         # log1p는 log(x+1)로, 0인 값도 에러 없이 처리해줌
+#         pivot_df = np.log1p(pivot_df)
+
+#     # -------------------------------------------------------
+#     # [전처리 2] 차분 (Trend 제거 -> Stationarity 확보)
+#     # -------------------------------------------------------
+#     if apply_diff:
+#         print("🔧 [전처리] 1차 차분 적용 (Differencing)")
+#         pivot_df = pivot_df.diff().dropna() # 첫 행은 NaN 되므로 제거
+
+#     # -------------------------------------------------------
+#     # [옵션] 극단적 아웃라이어 캡핑 (Winsorizing)
+#     # 로그 변환으로도 부족할 때 사용 (예: 상위 1% 값으로 제한)
+#     # -------------------------------------------------------
+#     # upper_limit = pivot_df.quantile(0.99)
+#     # pivot_df = pivot_df.clip(upper=upper_limit, axis=1)
+
+#     print(f"✅ 데이터 준비 완료. (최종 {len(pivot_df)}개월, {len(pivot_df.columns)}개 품목)")
+#     return pivot_df
 
 def run_correlation_method(pivot_df, method_name='pearson', threshold=0.7):
     """
@@ -139,7 +202,8 @@ def run_granger_method(pivot_df, p_val_thr=0.05):
                 continue
 
     return pd.DataFrame(results)
-
+from collections import defaultdict
+a = defaultdict(int)
 def run_granger_method(pivot_df, p_val_thr=0.05, min_nonzero_ratio=0.5):
     """
     min_nonzero_ratio: 0이 아닌 데이터가 전체 기간 중 최소 이 비율 이상이어야 테스트 진행 (0.5 = 50%)
@@ -153,8 +217,19 @@ def run_granger_method(pivot_df, p_val_thr=0.05, min_nonzero_ratio=0.5):
     total_len = len(pivot_df)
 
     for target in tqdm(items, desc="Granger"): 
+        # y = pivot_df[target].values
+        # if np.count_nonzero(y) < 12:
+        #     continue
+        s1 = pivot_df[target]
+        if (s1 != 0).mean() < min_nonzero_ratio:
+            # print(target)
+            continue
         for candidate in items: 
             if target == candidate: continue
+
+            # x = pivot_df[candidate].values
+            # if np.count_nonzero(x) < 12:
+            #     continue
             
             # 두 컬럼 데이터 추출
             s1 = pivot_df[target]
@@ -164,13 +239,15 @@ def run_granger_method(pivot_df, p_val_thr=0.05, min_nonzero_ratio=0.5):
             # [추가된 로직] 데이터 희소성(Sparsity) 체크
             # ---------------------------------------------------------
             # 1. 각 아이템이 0이 아닌 구간이 너무 적으면 스킵 (노이즈 방지)
-            if (s1 != 0).mean() < min_nonzero_ratio or (s2 != 0).mean() < min_nonzero_ratio:
+            if (s2 != 0).mean() < min_nonzero_ratio:
+                # print(target, candidate)
                 continue
 
             # 2. 두 아이템이 "동시에" 0이 아닌 구간이 너무 적어도 스킵
             # (교집합 구간이 없으면 인과성 판단 불가)
             common_nonzero = ((s1 != 0) & (s2 != 0)).sum()
             if common_nonzero < (total_len * 0.3): # 예: 겹치는 구간이 30% 미만이면 스킵
+                print(target, candidate)
                 continue
             # ---------------------------------------------------------
 
@@ -179,28 +256,70 @@ def run_granger_method(pivot_df, p_val_thr=0.05, min_nonzero_ratio=0.5):
             # 표준편차가 0이면(값 변화가 아예 없으면) 에러나므로 스킵
             if data.std().min() == 0: continue
             
-            try:
-                gc_res = grangercausalitytests(data, maxlag=MAX_LAG, verbose=False)
-                
-                is_causal = False
-                for lag in range(1, MAX_LAG + 1):
-                    p_value = gc_res[lag][0]['ssr_ftest'][1]
-                    if p_value < p_val_thr:
-                        is_causal = True
-                        break 
-                
-                if is_causal:
-                    results.append({
-                        'leading_item_id': candidate,
-                        'following_item_id': target,
-                        'value': DUMMY_VALUE
-                    })
+            gc_res = grangercausalitytests(data, maxlag=MAX_LAG, verbose=False)
+
+            min_p_value = 1.0
+            best_lag = 0
+
+            # 모든 Lag에 대해 검사해서 가장 강력한 신호(가장 낮은 P-value)를 찾음
+            # for lag in range(1, MAX_LAG + 1):
+            #     # ssr_ftest의 p-value 추출
+            #     p_val = gc_res[lag][0]['ssr_ftest'][1]
+            #     if p_val < min_p_value:
+            #         min_p_value = p_val
+            #         best_lag = lag
+
+            # # 기준 통과 시 결과 저장 (P-value도 같이 저장!)
+            # if min_p_value < p_val_thr:
+            #     results.append({
+            #         'leading_item_id': candidate,
+            #         'following_item_id': target,
+            #         'p_value': min_p_value,  # <-- 이걸 저장해야 나중에 비교 가능
+            #         'lag': best_lag,
+            #         'value': 0 # 예측값 (나중에 채움)
+            #     })
+            best_p_value = 1.0
+            for lag in range(1, MAX_LAG + 1):
+                    # F-test의 p-value
+                    p_val = gc_res[lag][0]['ssr_ftest'][1]
                     
-            except Exception:
-                continue
+                    # 팁: 단순히 하나라도 통과하면 OK가 아니라,
+                    # 가장 강력한 신호(최소 p-value)를 찾습니다.
+                    if p_val < best_p_value:
+                        best_p_value = p_val
+                        best_lag = lag
+                
+                # 기준 통과 시
+            if best_p_value < p_val_thr:
+                results.append({
+                    'leading_item_id': candidate,
+                    'following_item_id': target,
+                    'lag': best_lag,       # 몇 달 전 반응인지 저장
+                    'p_value': best_p_value,
+                    'value': 0 # 나중에 예측
+                })
 
-    return pd.DataFrame(results)
+    # res_df = pd.DataFrame(results)
 
+    # # A->B 와 B->A 가 둘 다 존재할 경우, P-value가 더 작은(더 확실한) 쪽만 남기기
+    # # (선택 사항: 양방향성을 인정하고 싶으면 이 단계 생략 가능)
+    # final_results = []
+    # for idx, row in res_df.iterrows():
+    #     # 반대 방향 쌍이 있는지 확인
+    #     reverse_pair = res_df[
+    #         (res_df['leading_item_id'] == row['following_item_id']) & 
+    #         (res_df['following_item_id'] == row['leading_item_id'])
+    #     ]
+        
+    #     if not reverse_pair.empty:
+    #         # 반대 방향의 P-value와 비교
+    #         reverse_p = reverse_pair.iloc[0]['p_value']
+    #         if row['p_value'] < reverse_p:
+    #             final_results.append(row) # 내가 더 쎄니까 내가 살아남음
+    #     else:
+    #         final_results.append(row) # 반대 방향 없으면 무조건 생존
+
+    return pd.DataFrame(results)#[['leading_item_id', 'following_item_id', 'value']]
 # ==========================================
 # [메인 실행 코드]
 # ==========================================
@@ -209,9 +328,9 @@ def run_granger_method(pivot_df, p_val_thr=0.05, min_nonzero_ratio=0.5):
 df_pivot = load_and_preprocess(DATA_PATH)
 
 # 2. 피어슨 (Pearson) 실행 및 저장
-df_pearson = run_correlation_method(df_pivot, method_name='pearson', threshold=PEARSON_THR)
-df_pearson.to_csv('submission_PEARSON.csv', index=False)
-print(f"👉 피어슨 결과 저장 완료: {len(df_pearson)}개 쌍 발견")
+# df_pearson = run_correlation_method(df_pivot, method_name='pearson', threshold=PEARSON_THR)
+# df_pearson.to_csv('submission_PEARSON.csv', index=False)
+# print(f"👉 피어슨 결과 저장 완료: {len(df_pearson)}개 쌍 발견")
 
 # # 3. 스피어만 (Spearman) 실행 및 저장
 # df_spearman = run_correlation_method(df_pivot, method_name='spearman', threshold=SPEARMAN_THR)
@@ -219,8 +338,8 @@ print(f"👉 피어슨 결과 저장 완료: {len(df_pearson)}개 쌍 발견")
 # print(f"👉 스피어만 결과 저장 완료: {len(df_spearman)}개 쌍 발견")
 
 # 4. 그레인저 (Granger) 실행 및 저장
-# df_granger = run_granger_method(df_pivot, p_val_thr=GRANGER_P_VAL)
-# df_granger.to_csv('submission_GRANGER.csv', index=False)
-# print(f"👉 그레인저 결과 저장 완료: {len(df_granger)}개 쌍 발견")
-
+df_granger = run_granger_method(df_pivot, p_val_thr=GRANGER_P_VAL)
+df_granger.to_csv('submission_GRANGER.csv', index=False)
+print(f"👉 그레인저 결과 저장 완료: {len(df_granger)}개 쌍 발견")
+print(a)
 print("\n🎉 모든 파일 생성 완료! 제출해서 F1 Score를 확인해보세요.")
