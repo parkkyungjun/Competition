@@ -11,13 +11,14 @@ warnings.filterwarnings("ignore")
 # [설정] 이 값들을 조절해서 실험해보세요
 # ==========================================
 DATA_PATH = 'train.csv'
+MIN_LAG = 1
 MAX_LAG = 12           # 최대 6개월 전 데이터까지 확인
 DUMMY_VALUE = 9999999999 # 예측을 일부러 틀리기 위한 큰 값
 
 # 실험별 기준값 (Threshold)
 PEARSON_THR = 0.4     # 상관계수 0.7 이상이면 짝꿍
-SPEARMAN_THR = 0.7    # 상관계수 0.7 이상이면 짝꿍
-GRANGER_P_VAL = 0.01  # P-value 0.05 미만이면 짝꿍 (유의수준 5%)
+SPEARMAN_THR = 0.4    # 상관계수 0.7 이상이면 짝꿍
+GRANGER_P_VAL = 0.05  # P-value 0.05 미만이면 짝꿍 (유의수준 5%)
 # ==========================================
 
 def load_and_preprocess(path):
@@ -86,9 +87,9 @@ def analyze_zero_counts(pivot_df):
 #     # -------------------------------------------------------
 #     # [전처리 2] 차분 (Trend 제거 -> Stationarity 확보)
 #     # -------------------------------------------------------
-#     if apply_diff:
-#         print("🔧 [전처리] 1차 차분 적용 (Differencing)")
-#         pivot_df = pivot_df.diff().dropna() # 첫 행은 NaN 되므로 제거
+#     # if apply_diff:
+#     #     print("🔧 [전처리] 1차 차분 적용 (Differencing)")
+#     #     pivot_df = pivot_df.diff().dropna() # 첫 행은 NaN 되므로 제거
 
 #     # -------------------------------------------------------
 #     # [옵션] 극단적 아웃라이어 캡핑 (Winsorizing)
@@ -100,7 +101,7 @@ def analyze_zero_counts(pivot_df):
 #     print(f"✅ 데이터 준비 완료. (최종 {len(pivot_df)}개월, {len(pivot_df.columns)}개 품목)")
 #     return pivot_df
 
-def run_correlation_method(pivot_df, method_name='pearson', threshold=0.7):
+def run_correlation_method(pivot_df, method_name='pearson', threshold=0.7, min_nonzero_ratio=0.5):
     """
     피어슨 또는 스피어만 상관계수로 짝꿍 찾기
     method_name: 'pearson' 또는 'spearman'
@@ -125,6 +126,9 @@ def run_correlation_method(pivot_df, method_name='pearson', threshold=0.7):
 
             y = pivot_df[target]
             x = pivot_df[candidate]
+            
+            if (x != 0).mean() < min_nonzero_ratio:
+                continue
             
             best_corr = 0
             
@@ -158,50 +162,145 @@ def run_correlation_method(pivot_df, method_name='pearson', threshold=0.7):
                 
     return pd.DataFrame(results)
 
-def run_granger_method(pivot_df, p_val_thr=0.05):
-    """그레인저 인과관계 테스트로 짝꿍 찾기"""
+import numpy as np
+import pandas as pd
+from tqdm import tqdm
+
+def run_correlation_method_linear(pivot_df, method_name='pearson', threshold=0.7, min_nonzero_ratio=0.5, MAX_LAG=5):
+    """
+    상관계수로 짝꿍을 찾고, 선형 회귀로 값을 예측하여 평균을 반환
+    """
     items = pivot_df.columns
     results = []
     
-    print(f"\n🚀 [GRANGER] 분석 시작... (시간이 좀 걸립니다)")
+    print(f"\n🚀 [{method_name.upper()}] 분석 및 Linear Regression 예측 시작...")
     
-    for target in tqdm(items, desc="Granger"): # B (후행)
+    for target in tqdm(items, desc=f"{method_name}"): # B (후행)
+        
+        # 타겟 데이터 (y)
+        y_raw = pivot_df[target] # 원본 시리즈 유지
+        y_values = y_raw.values
+        
+        if np.count_nonzero(y_values) < 12:
+            continue
+
         for candidate in items: # A (선행)
             if target == candidate: continue
+
+            x_raw = pivot_df[candidate]
+            x_values = x_raw.values
             
-            # 데이터 준비 (2차원 배열: [Target, Source])
-            # statsmodels는 [현재값, 과거값] 순서가 중요함. 보통 [y, x] 순서로 넣음
-            data = pd.concat([pivot_df[target], pivot_df[candidate]], axis=1)
+            if np.count_nonzero(x_values) < 12:
+                continue
             
-            # 데이터가 모두 0이거나 변화가 없으면 에러나므로 스킵
-            if data.std().min() == 0: continue
+            if (x_raw != 0).mean() < min_nonzero_ratio:
+                continue
             
-            try:
-                # Granger 테스트 실행 (maxlag까지 한 번에 검사)
-                gc_res = grangercausalitytests(data, maxlag=MAX_LAG, verbose=False)
+            best_corr = 0
+            best_lag = 0  # 최적의 Lag를 저장할 변수 추가
+            
+            # Lag 1 ~ MAX_LAG 탐색
+            for lag in range(1, MAX_LAG + 1):
+                # A를 lag만큼 밀어서 B와 비교
+                x_shifted = x_raw.shift(lag)
                 
-                is_causal = False
+                # 결측치 제거 후 상관계수 계산을 위한 마스크
+                valid_mask = ~np.isnan(x_shifted) & ~np.isnan(y_raw)
                 
-                # 모든 Lag에 대해 P-value 확인
-                for lag in range(1, MAX_LAG + 1):
-                    # F-test의 P-value 가져오기
-                    p_value = gc_res[lag][0]['ssr_ftest'][1]
+                if valid_mask.sum() < 10: continue
+                
+                # 상관계수 계산
+                if method_name == 'pearson':
+                    corr = np.corrcoef(x_shifted[valid_mask], y_raw[valid_mask])[0, 1]
+                elif method_name == 'spearman':
+                    # numpy에는 스피어만이 없어서 pandas로 계산 (속도를 위해 필요한 부분만 추출)
+                    temp_df = pd.DataFrame({'A': x_shifted[valid_mask], 'B': y_raw[valid_mask]})
+                    corr = temp_df.corr(method='spearman').iloc[0, 1]
+                
+                # 절댓값 기준으로 최적의 상관계수 갱신
+                if abs(corr) > abs(best_corr):
+                    best_corr = corr
+                    best_lag = lag
+            
+            # 기준 넘으면 Linear Regression 수행
+            if abs(best_corr) >= threshold:
+                
+                # 1. 최적의 Lag로 데이터 셋 구성
+                x_best_shifted = x_raw.shift(best_lag)
+                valid_idx = ~np.isnan(x_best_shifted) & ~np.isnan(y_raw)
+                
+                X_train = x_best_shifted[valid_idx].values
+                Y_train = y_raw[valid_idx].values
+                
+                # 2. Linear Regression (1차원 다항식 적합 = 선형회귀)
+                # slope: 기울기, intercept: 절편
+                if len(X_train) > 1: # 데이터가 충분할 때만
+                    slope, intercept = np.polyfit(X_train, Y_train, 1)
                     
-                    if p_value < p_val_thr:
-                        is_causal = True
-                        break # 하나라도 인과성 있으면 통과
-                
-                if is_causal:
+                    # 3. 예측값 생성 (Predict)
+                    # 옵션 A: 교집합(valid_idx) 구간에 대해서만 예측할 경우
+                    y_pred = slope * X_train + intercept
+                    
+                    # 옵션 B: (선택사항) X가 존재하는 전체 구간에 대해 예측하고 싶다면 아래 주석 해제
+                    # valid_x_all = x_best_shifted.dropna()
+                    # y_pred = slope * valid_x_all + intercept
+                    
+                    # 4. 예측값들의 평균 계산
+                    predicted_mean_value = np.mean(y_pred)
+                    
                     results.append({
                         'leading_item_id': candidate,
                         'following_item_id': target,
-                        'value': DUMMY_VALUE
+                        'value': predicted_mean_value # 요청하신: 예측값들의 평균
                     })
-                    
-            except Exception:
-                continue
 
     return pd.DataFrame(results)
+
+# def run_granger_method(pivot_df, p_val_thr=0.05):
+#     """그레인저 인과관계 테스트로 짝꿍 찾기"""
+#     items = pivot_df.columns
+#     results = []
+    
+#     print(f"\n🚀 [GRANGER] 분석 시작... (시간이 좀 걸립니다)")
+    
+#     for target in tqdm(items, desc="Granger"): # B (후행)
+#         for candidate in items: # A (선행)
+#             if target == candidate: continue
+            
+#             # 데이터 준비 (2차원 배열: [Target, Source])
+#             # statsmodels는 [현재값, 과거값] 순서가 중요함. 보통 [y, x] 순서로 넣음
+#             data = pd.concat([pivot_df[target], pivot_df[candidate]], axis=1)
+            
+#             # 데이터가 모두 0이거나 변화가 없으면 에러나므로 스킵
+#             if data.std().min() == 0: continue
+            
+#             try:
+#                 # Granger 테스트 실행 (maxlag까지 한 번에 검사)
+#                 gc_res = grangercausalitytests(data, maxlag=MAX_LAG, verbose=False)
+                
+#                 is_causal = False
+                
+#                 # 모든 Lag에 대해 P-value 확인
+#                 for lag in range(1, MAX_LAG + 1):
+#                     # F-test의 P-value 가져오기
+#                     p_value = gc_res[lag][0]['ssr_ftest'][1]
+                    
+#                     if p_value < p_val_thr:
+#                         is_causal = True
+#                         break # 하나라도 인과성 있으면 통과
+                
+#                 if is_causal:
+#                     results.append({
+#                         'leading_item_id': candidate,
+#                         'following_item_id': target,
+#                         'value': DUMMY_VALUE
+#                     })
+                    
+#             except Exception:
+#                 continue
+
+#     return pd.DataFrame(results)
+
 from collections import defaultdict
 a = defaultdict(int)
 def run_granger_method(pivot_df, p_val_thr=0.05, min_nonzero_ratio=0.5):
@@ -261,43 +360,29 @@ def run_granger_method(pivot_df, p_val_thr=0.05, min_nonzero_ratio=0.5):
             min_p_value = 1.0
             best_lag = 0
 
-            # 모든 Lag에 대해 검사해서 가장 강력한 신호(가장 낮은 P-value)를 찾음
-            # for lag in range(1, MAX_LAG + 1):
-            #     # ssr_ftest의 p-value 추출
-            #     p_val = gc_res[lag][0]['ssr_ftest'][1]
-            #     if p_val < min_p_value:
-            #         min_p_value = p_val
-            #         best_lag = lag
-
-            # # 기준 통과 시 결과 저장 (P-value도 같이 저장!)
-            # if min_p_value < p_val_thr:
-            #     results.append({
-            #         'leading_item_id': candidate,
-            #         'following_item_id': target,
-            #         'p_value': min_p_value,  # <-- 이걸 저장해야 나중에 비교 가능
-            #         'lag': best_lag,
-            #         'value': 0 # 예측값 (나중에 채움)
-            #     })
             best_p_value = 1.0
-            for lag in range(1, MAX_LAG + 1):
-                    # F-test의 p-value
-                    p_val = gc_res[lag][0]['ssr_ftest'][1]
-                    
-                    # 팁: 단순히 하나라도 통과하면 OK가 아니라,
-                    # 가장 강력한 신호(최소 p-value)를 찾습니다.
-                    if p_val < best_p_value:
-                        best_p_value = p_val
-                        best_lag = lag
+            for lag in range(MIN_LAG, MAX_LAG + 1):
+                # F-test의 p-value
+                p_val = gc_res[lag][0]['ssr_ftest'][1]
+                
+                # 팁: 단순히 하나라도 통과하면 OK가 아니라,
+                # 가장 강력한 신호(최소 p-value)를 찾습니다.
+                # if p_val < best_p_value:
+                #     best_p_value = p_val
+                #     best_lag = lag
+
                 
                 # 기준 통과 시
-            if best_p_value < p_val_thr:
-                results.append({
-                    'leading_item_id': candidate,
-                    'following_item_id': target,
-                    'lag': best_lag,       # 몇 달 전 반응인지 저장
-                    'p_value': best_p_value,
-                    'value': 0 # 나중에 예측
-                })
+                if p_val < p_val_thr:
+                    results.append({
+                        'leading_item_id': candidate,
+                        'following_item_id': target,
+                        # 'lag': best_lag,       # 몇 달 전 반응인지 저장
+                        # 'p_value': best_p_value,
+                        'value': DUMMY_VALUE # 나중에 예측
+                    })
+                    break
+                
 
     # res_df = pd.DataFrame(results)
 
@@ -320,6 +405,85 @@ def run_granger_method(pivot_df, p_val_thr=0.05, min_nonzero_ratio=0.5):
     #         final_results.append(row) # 반대 방향 없으면 무조건 생존
 
     return pd.DataFrame(results)#[['leading_item_id', 'following_item_id', 'value']]
+
+def run_ensemble_and_predict(df_p, df_s, df_g, pivot_df, max_lag=12, min_nonzero_ratio=0.5):
+    """
+    3개 결과의 교집합을 구하고, 해당 쌍들에 대해 선형회귀 예측을 수행
+    """
+    print(f"\n🚀 [ENSEMBLE] 3가지 방법(Pearson, Spearman, Granger) 교집합 추출 중...")
+    
+    # 1. 각 결과에서 (선행, 후행) 쌍만 추출하여 Set으로 변환
+    pairs_p = set(zip(df_p['leading_item_id'], df_p['following_item_id']))
+    pairs_s = set(zip(df_s['leading_item_id'], df_s['following_item_id']))
+    pairs_g = set(zip(df_g['leading_item_id'], df_g['following_item_id']))
+    
+    # 2. 교집합 구하기 (세 가지 방법 모두에서 발견된 쌍)
+    common_pairs = pairs_p & pairs_s & pairs_g
+    
+    print(f"👉 Pearson: {len(pairs_p)}, Spearman: {len(pairs_s)}, Granger: {len(pairs_g)}")
+    print(f"✅ 최종 교집합 쌍 개수: {len(common_pairs)}")
+    
+    results = []
+    
+    # 3. 교집합 쌍에 대해 선형회귀 및 예측 수행
+    for lead, follow in tqdm(common_pairs, desc="Ensemble Regression"):
+        
+        # 데이터 추출
+        y_raw = pivot_df[follow]
+        x_raw = pivot_df[lead]
+        
+        # 기본적인 데이터 검증 (이미 통과했겠지만 안전장치)
+        if (x_raw != 0).mean() < min_nonzero_ratio: continue
+        
+        # -----------------------------------------------
+        # 최적의 Lag 다시 찾기 (선형회귀를 위해 Pearson 기준 사용)
+        # -----------------------------------------------
+        best_corr = 0
+        best_lag = 1
+        
+        for lag in range(1, max_lag + 1):
+            x_shifted = x_raw.shift(lag)
+            valid_mask = ~np.isnan(x_shifted) & ~np.isnan(y_raw)
+            
+            if valid_mask.sum() < 10: continue
+            
+            # Linear Regression은 선형성을 전제로 하므로 Pearson 상관계수가 높은 Lag를 선택
+            corr = np.corrcoef(x_shifted[valid_mask], y_raw[valid_mask])[0, 1]
+            
+            if abs(corr) > abs(best_corr):
+                best_corr = corr
+                best_lag = lag
+        
+        # -----------------------------------------------
+        # 선형 회귀 (Linear Regression) 적합 및 예측
+        # -----------------------------------------------
+        x_best_shifted = x_raw.shift(best_lag)
+        valid_idx = ~np.isnan(x_best_shifted) & ~np.isnan(y_raw)
+        
+        X_train = x_best_shifted[valid_idx].values
+        Y_train = y_raw[valid_idx].values
+        
+        if len(X_train) > 1:
+            # 1차 방정식 적합 (y = ax + b)
+            slope, intercept = np.polyfit(X_train, Y_train, 1)
+            
+            # 예측값 생성 (X_train 구간에 대해 예측)
+            y_pred = slope * X_train + intercept
+            
+            # (옵션) 예측값 중 음수가 나오면 0으로 처리 (무역량이므로)
+            # y_pred = np.maximum(y_pred, 0)
+            
+            # 평균값 계산
+            predicted_mean_value = np.mean(y_pred)
+            
+            results.append({
+                'leading_item_id': lead,
+                'following_item_id': follow,
+                'value': predicted_mean_value
+            })
+            
+    return pd.DataFrame(results)
+
 # ==========================================
 # [메인 실행 코드]
 # ==========================================
@@ -328,18 +492,34 @@ def run_granger_method(pivot_df, p_val_thr=0.05, min_nonzero_ratio=0.5):
 df_pivot = load_and_preprocess(DATA_PATH)
 
 # 2. 피어슨 (Pearson) 실행 및 저장
-# df_pearson = run_correlation_method(df_pivot, method_name='pearson', threshold=PEARSON_THR)
-# df_pearson.to_csv('submission_PEARSON.csv', index=False)
-# print(f"👉 피어슨 결과 저장 완료: {len(df_pearson)}개 쌍 발견")
+df_pearson = run_correlation_method(df_pivot, method_name='pearson', threshold=PEARSON_THR)
+# df_pearson = run_correlation_method_linear(df_pivot, method_name='pearson', threshold=PEARSON_THR, min_nonzero_ratio=0.5, MAX_LAG=MAX_LAG)
+df_pearson.to_csv('submission_PEARSON.csv', index=False)
+print(f"👉 피어슨 결과 저장 완료: {len(df_pearson)}개 쌍 발견")
 
-# # 3. 스피어만 (Spearman) 실행 및 저장
-# df_spearman = run_correlation_method(df_pivot, method_name='spearman', threshold=SPEARMAN_THR)
-# df_spearman.to_csv('submission_SPEARMAN.csv', index=False)
-# print(f"👉 스피어만 결과 저장 완료: {len(df_spearman)}개 쌍 발견")
+# 3. 스피어만 (Spearman) 실행 및 저장
+df_spearman = run_correlation_method(df_pivot, method_name='spearman', threshold=SPEARMAN_THR)
+df_spearman.to_csv('submission_SPEARMAN.csv', index=False)
+print(f"👉 스피어만 결과 저장 완료: {len(df_spearman)}개 쌍 발견")
 
 # 4. 그레인저 (Granger) 실행 및 저장
 df_granger = run_granger_method(df_pivot, p_val_thr=GRANGER_P_VAL)
 df_granger.to_csv('submission_GRANGER.csv', index=False)
 print(f"👉 그레인저 결과 저장 완료: {len(df_granger)}개 쌍 발견")
-print(a)
-print("\n🎉 모든 파일 생성 완료! 제출해서 F1 Score를 확인해보세요.")
+
+if len(df_pearson) > 0 and len(df_spearman) > 0 and len(df_granger) > 0:
+    df_final = run_ensemble_and_predict(
+        df_pearson, 
+        df_spearman, 
+        df_granger, 
+        df_pivot, 
+        max_lag=MAX_LAG
+    )
+    
+    # 최종 저장
+    df_final.to_csv('submission_ENSEMBLE.csv', index=False)
+    print(f"\n🎉 최종 앙상블 파일 생성 완료! (submission_ENSEMBLE.csv)")
+    print(f"📊 최종 검출된 쌍: {len(df_final)}개")
+    print(df_final.head())
+else:
+    print("\n⚠️ 교집합을 구할 충분한 데이터가 없습니다. 기준값(Threshold)을 낮춰보세요.")
