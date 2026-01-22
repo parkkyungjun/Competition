@@ -169,3 +169,7 @@ NPR/assets
 NPR/networks
 NPR/train
 NPR/test
+NPR/sorted_groups
+NPR/cropped_faces
+NPR/cropped_shifted_512
+NPR/face

@@ -159,9 +159,9 @@ class PathAwareRandomCrop(object):
 
 # --- 2. 커스텀 Dataset ---
 class MixedContentDataset(Dataset):
-    def __init__(self, class1_files, class0_files, transform_c1, transform_c0):
-        self.transform_c1 = transform_c1
-        self.transform_c0 = transform_c0
+    def __init__(self, class1_files, class0_files, crop_transform, transform):
+        self.crop_transform = crop_transform
+        self.transform = transform
         self.samples = []
         
         for f in class1_files:
@@ -175,42 +175,88 @@ class MixedContentDataset(Dataset):
     def __getitem__(self, idx):
         filepath, label = self.samples[idx]
 
-        if filepath.endswith(('.mp4', '.avi', '.mkv')):
-            cap = cv2.VideoCapture(filepath)
-            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        # if filepath.endswith(('.mp4', '.avi', '.mkv')):
+        #     cap = cv2.VideoCapture(filepath)
+        #     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             
-            if frame_count > 0:
-                random_idx = random.randint(0, frame_count - 1)
-                cap.set(cv2.CAP_PROP_POS_FRAMES, random_idx)
+        #     if frame_count > 0:
+        #         random_idx = random.randint(0, frame_count - 1)
+        #         cap.set(cv2.CAP_PROP_POS_FRAMES, random_idx)
             
-            ret, frame = cap.read()
-            cap.release()
+        #     ret, frame = cap.read()
+        #     cap.release()
             
-            if not ret:
-                raise Exception(f"Failed to read frame at {random_idx}: {filepath}")
+        #     if not ret:
+        #         raise Exception(f"Failed to read frame at {random_idx}: {filepath}")
             
-            img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            img = Image.fromarray(img)
+        #     img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        #     img = Image.fromarray(img)
             
-        else:
-            img = Image.open(filepath).convert('RGB')
+        # else:
+        img = Image.open(filepath).convert('RGB')
         
         w, h = img.size
         if w % 2 == 1: w += 1
         if h % 2 == 1: h += 1
             
         img = img.resize((w, h))
-        if label == 1:
-            img = self.transform_c1(img)
-        else:
-            img = self.transform_c0(img)
+        # img = self.crop_transform((img, filepath))
+        img = self.transform(img)
         
         return img, torch.tensor(label, dtype=torch.float32), filepath
+
+# --- [추가] 커스텀 Batch Sampler ---
+class BalancedBatchSampler(torch.utils.data.Sampler):
+    def __init__(self, dataset, batch_size):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        
+        # 데이터셋에서 레이블 정보 추출
+        # MixedContentDataset.samples는 (filepath, label) 튜플 리스트라고 가정
+        self.indices_c0 = [i for i, (_, label) in enumerate(dataset.samples) if label == 0]
+        self.indices_c1 = [i for i, (_, label) in enumerate(dataset.samples) if label == 1]
+        
+        # 배치 사이즈는 반드시 짝수여야 함
+        assert batch_size % 2 == 0, "Batch size must be even for 50:50 split."
+        
+        # 한 에폭당 배치의 수 결정 (데이터가 많은 클래스 기준으로 설정하여 오버샘플링 효과)
+        # 만약 적은 클래스 기준으로 하려면 min()을 사용하세요.
+        self.max_len = max(len(self.indices_c0), len(self.indices_c1))
+        self.n_batches = self.max_len // (self.batch_size // 2)
+        
+    def __iter__(self):
+        # 매 에폭마다 인덱스 섞기
+        idx0 = np.array(self.indices_c0)
+        idx1 = np.array(self.indices_c1)
+        np.random.shuffle(idx0)
+        np.random.shuffle(idx1)
+        
+        # 반반씩 가져오기 위해 필요한 총 개수
+        target_len = self.n_batches * (self.batch_size // 2)
+        
+        # 데이터가 부족한 쪽은 반복(Cycle/Resize)해서 채움
+        idx0 = np.resize(idx0, target_len)
+        idx1 = np.resize(idx1, target_len)
+        
+        for i in range(self.n_batches):
+            start = i * (self.batch_size // 2)
+            end = start + (self.batch_size // 2)
+            
+            # 0번 클래스 절반 + 1번 클래스 절반
+            batch_indices = np.concatenate([idx0[start:end], idx1[start:end]])
+            
+            # 배치 내부에서 순서 섞기 (선택 사항, 모델 학습에 더 좋음)
+            np.random.shuffle(batch_indices)
+            
+            yield batch_indices.astype(int)
+
+    def __len__(self):
+        return self.n_batches
 
 # --- 3. 데이터 준비 및 분할 ---
 def get_data_loaders(batch_size):
     # 이미지/비디오 확장자 필터
-    valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.mp4', '.avi', 'webp', 'jfif')
+    valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp', 'webp', 'jfif')
     
     # --- 클래스 1 파일 로드 ---
     path_class1 = 'train/fake'
@@ -220,61 +266,63 @@ def get_data_loaders(batch_size):
     # --- 클래스 0 파일 로드 ---
     path_class0_list = []
     path_class0_list.append(os.path.expanduser('~/.cache/kagglehub/datasets/sautkin/imagenet1k1/versions/2'))
-    path_class0_list.append(os.path.expanduser('NPR/train/real/videezy'))
-    path_class0_list.append(os.path.expanduser('NPR/train/real/youtube'))
+    path_class0_list.append('train/real/videezy')
+    path_class0_list.append('train/real/youtube')
     
     all_files_c0 = []
     val_c0 = []
     
+    # ... (기존 파일 로딩 로직 유지) ...
     for i in path_class0_list:
-        all_files_c0_file = glob.glob(os.path.join(i, '**', '*'), recursive=True)
-        all_files_c0_file = random.sample(all_files_c0_file, 1000)
-        all_files_c0 += [f for f in all_files_c0_file]
-        if len(all_files_c0_file) < 1000:
-            val_c0 += [f for f in all_files_c0_file]
+        temp_files = glob.glob(os.path.join(i, '**', '*'), recursive=True)
+        valid_files = [f for f in temp_files if f.lower().endswith(valid_extensions)]
+        sample_count = min(1000, len(valid_files))
+        sampled_files = random.sample(valid_files, sample_count)
+        all_files_c0 += sampled_files
+        if len(valid_files) < 1000:
+            val_c0 += sampled_files
             
-    print(f"발견된 클래스 1 파일 수: {len(all_files_c1)}")
-    print(f"발견된 클래스 0 파일 수: {len(all_files_c0)}")
-
-    real = "./real"
-    real = glob.glob(real+'/**', recursive=True)
-    real = [f for f in real if f.lower().endswith(valid_extensions)]
+    print(f"학습 클래스 1 파일 수: {len(all_files_c1)}")
+    print(f"학습 클래스 0 파일 수: {len(all_files_c0)}")
             
-    val_files_c1 = all_files_c1
+    val_files_c1 = all_files_c1 # (참고: 검증셋 로직은 사용자 의도에 맞게 유지)
     val_files_c0 = val_c0
 
-    print(f"검증셋: 클래스1 {len(val_files_c1)}, 클래스0 {len(val_files_c0)}")
-
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
+    crop_transform = PathAwareRandomCrop(output_size=200, avoid_br_size=200, avoid_tr_size=200)
 
     transform = transforms.Compose([
-        # transforms.CenterCrop((CROP_SIZE, CROP_SIZE)),
-        PathAwareRandomCrop((CROP_SIZE, CROP_SIZE), 200, 200),
+        transforms.CenterCrop(CROP_SIZE),
         transforms.ToTensor(),
-        normalize
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
-    train_dataset = MixedContentDataset(all_files_c1, all_files_c0, transform, transform)
-    val_dataset = MixedContentDataset(val_files_c1, val_files_c0, transform, transform)
+    train_dataset = MixedContentDataset(all_files_c1, all_files_c0, crop_transform, transform)
+    val_dataset = MixedContentDataset(val_files_c1, val_files_c0, crop_transform, transform)
+    
+    # [핵심 변경] BalancedBatchSampler 생성
+    train_batch_sampler = BalancedBatchSampler(train_dataset, batch_size=batch_size)
     
     train_loader = DataLoader(
         train_dataset,
-        batch_size=BATCH_SIZE,
-        shuffle=True,
+        # batch_size와 shuffle은 batch_sampler와 함께 쓸 수 없으므로 제거
+        batch_sampler=train_batch_sampler, 
         num_workers=8,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True,
+        prefetch_factor=4
     )
+    
+    # Validation은 굳이 5:5일 필요 없으므로 기존 방식 유지 (평가 목적)
     val_loader = DataLoader(
         val_dataset,
-        batch_size=BATCH_SIZE,
+        batch_size=batch_size,
         shuffle=False,
         num_workers=8,
-        pin_memory=True
+        pin_memory=True,
+        persistent_workers=True,
     )
     
     return train_loader, val_loader
-
 def validate(model, loader, criterion, device, save_dir="wrong_samples"):
     model.eval()
     total_loss = 0
@@ -288,9 +336,9 @@ def validate(model, loader, criterion, device, save_dir="wrong_samples"):
     all_preds = []
 
     # 오답 저장 폴더 생성
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-        print(f"Created directory for wrong samples: {save_dir}")
+    # if not os.path.exists(save_dir):
+    #     os.makedirs(save_dir)
+    #     print(f"Created directory for wrong samples: {save_dir}")
     
     with torch.no_grad():
         for images, labels, names in loader:
@@ -309,24 +357,23 @@ def validate(model, loader, criterion, device, save_dir="wrong_samples"):
             total += labels.size(0)
 
             # 오답 처리 및 저장
-            for i in range(labels.size(0)): 
-                is_correct = (preds[i] == labels[i]).item()
-                if not is_correct:
-                    pred_score = probs[i].item()
-                    true_label = labels[i].item()
-                    full_path = names[i]
-                    filename = os.path.basename(full_path)
+            # for i in range(labels.size(0)): 
+            #     is_correct = (preds[i] == labels[i]).item()
+                # if not is_correct:
+                #     pred_score = probs[i].item()
+                #     true_label = labels[i].item()
+                #     full_path = names[i]
+                #     filename = os.path.basename(full_path)
                     
-                    # 보기 쉽게 파일명에 예측값_라벨_원본이름 형식으로 저장
                     # 예: Pred_0.91_Label_0_image.jpg
-                    save_name = f"Pred_{pred_score:.4f}_Label_{int(true_label)}_{filename}"
-                    save_path = os.path.join(save_dir, save_name)
+                    # save_name = f"Pred_{pred_score:.4f}_Label_{int(true_label)}_{filename}"
+                    # save_path = os.path.join(save_dir, save_name)
                     
-                    try:
-                        shutil.copy(full_path, save_path)
-                        print(f"  [WRONG - SAVED] {save_name}")
-                    except Exception as e:
-                        print(f"  [WRONG - SAVE FAILED] {filename}: {e}")
+                    # try:
+                    #     shutil.copy(full_path, save_path)
+                    #     print(f"  [WRONG - SAVED] {save_name}")
+                    # except Exception as e:
+                    #     print(f"  [WRONG - SAVE FAILED] {filename}: {e}")
 
             # 클래스별 정확도
             c0_mask = (labels == 0)
@@ -373,7 +420,7 @@ def train_one_epoch(model, loader, criterion, optimizer, scaler, device, epoch):
         labels = labels.to(device).unsqueeze(1) # (B) -> (B, 1)
 
         # 1. Forward (Mixed Precision)
-        with torch.cuda.amp.autocast():
+        with torch.amp.autocast('cuda'):
             outputs = model(images)
             loss = criterion(outputs, labels)
 
@@ -430,12 +477,6 @@ if __name__ == "__main__":
     print("\n[Initializing Model...]")
     model = efficientnetb2_custom()
     
-    # 만약 이전에 학습하던 모델을 이어서 학습하려면 아래 주석 해제
-    # model_path = 'best_model.pth' 
-    # if os.path.exists(model_path):
-    #     print(f"Resuming from {model_path}")
-    #     model.load_state_dict(torch.load(model_path, map_location='cpu'))
-    
     model.to(device)
 
     # 4. Optimizer, Scheduler, Loss, Scaler 정의
@@ -444,11 +485,11 @@ if __name__ == "__main__":
     
     # 학습률 스케줄러 (Validation Loss가 개선되지 않으면 LR 감소)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=3, verbose=True
+        optimizer, mode='min', factor=0.5, patience=3
     )
     
     # Mixed Precision Scaler
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.amp.GradScaler('cuda')
 
     # 5. Training Loop
     best_f1 = 0.0
@@ -494,23 +535,23 @@ if __name__ == "__main__":
         print("-" * 60)
 
     print("Training Finished.")
-    BATCH_SIZE = 64
-    criterion = nn.BCEWithLogitsLoss() 
+    # BATCH_SIZE = 64
+    # criterion = nn.BCEWithLogitsLoss() 
     
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    # device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # print(f"Using device: {device}")
 
-    print("Loading data...")
-    train_loader, val_loader = get_data_loaders(BATCH_SIZE)
-    print("Data loading complete.")
+    # print("Loading data...")
+    # train_loader, val_loader = get_data_loaders(BATCH_SIZE)
+    # print("Data loading complete.")
 
-    print("Loading model...")
+    # print("Loading model...")
 
-    model = efficientnetb2_custom()
+    # model = efficientnetb2_custom()
 
-    model_path = 'model_epoch_1.pth'
-    model.load_state_dict(torch.load(model_path, map_location='cpu'), strict=True)
-    model.to(device)
+    # model_path = 'model_epoch_1.pth'
+    # model.load_state_dict(torch.load(model_path, map_location='cpu'), strict=True)
+    # model.to(device)
     
 
-    val_loss, val_acc, val_f1, val_c0, val_c1 = validate(model, val_loader, criterion, device)
+    # val_loss, val_acc, val_f1, val_c0, val_c1 = validate(model, val_loader, criterion, device)

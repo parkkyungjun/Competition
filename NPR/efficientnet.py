@@ -42,7 +42,7 @@ class CustomEfficientNet(nn.Module):
 
 
 def efficientnetb2_custom(pretrained: bool = False, num_classes=1):
-    base_model = efficientnet_b2(weights=EfficientNet_B2_Weights)
+    base_model = efficientnet_b2(weights=EfficientNet_B2_Weights.IMAGENET1K_V1)
     
     model = CustomEfficientNet(base_model, num_classes=num_classes)
     return model
