@@ -173,3 +173,12 @@ NPR/sorted_groups
 NPR/cropped_faces
 NPR/cropped_shifted_512
 NPR/face
+NPR/.python-version
+
+*.png
+*.jpg
+*.mp4
+*.pt
+*.pth
+*.txt
+*.jpeg

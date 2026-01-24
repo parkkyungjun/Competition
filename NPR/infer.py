@@ -6,6 +6,7 @@ import os
 import glob
 import pandas as pd
 from tqdm import tqdm
+import cv2  # OpenCV 추가
 
 # 모델 정의 파일이 같은 경로에 있어야 합니다.
 from efficientnet import efficientnetb2_custom
@@ -13,13 +14,9 @@ from efficientnet import efficientnetb2_custom
 # --- 설정 (Configuration) ---
 class Config:
     CROP_SIZE = 512
-    # 학습된 모델 가중치 경로
     MODEL_PATH = 'best_model_f1.pth' 
-    # 추론할 이미지가 있는 폴더 경로
-    INPUT_FOLDER = 'cropped_shifted_512'
-    # 결과 저장 파일명
+    INPUT_FOLDER = 'sorted_groups/group_009_'
     OUTPUT_CSV = 'inference_results.csv'
-    # 사용할 장치
     DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def load_model(model_path, device):
@@ -27,10 +24,8 @@ def load_model(model_path, device):
     print(f"[Info] Loading model from {model_path}...")
     model = efficientnetb2_custom()
     
-    # 가중치 로드 (CPU 매핑 포함하여 안전하게 로드)
     checkpoint = torch.load(model_path, map_location=device)
     
-    # state_dict 키 불일치 방지 (혹시 모를 DataParallel의 'module.' 접두사 제거)
     new_state_dict = {}
     for k, v in checkpoint.items():
         name = k.replace("module.", "") 
@@ -50,19 +45,53 @@ def get_transform():
     ])
 
 def preprocess_image(image_path, transform):
-    """단일 이미지 로드 및 전처리"""
+    """
+    이미지 또는 MP4 파일의 첫 프레임을 로드하여 전처리
+    """
     try:
-        img = Image.open(image_path).convert('RGB')
+        img = None
         
-        # 학습 코드의 리사이즈 로직 유지 (홀수 해상도 처리)
-        w, h = img.size
-        if w % 2 == 1: w += 1
-        if h % 2 == 1: h += 1
-        img = img.resize((w, h))
+        # 1. MP4 파일인 경우 첫 프레임 추출
+        if image_path.lower().endswith('.mp4'):
+            cap = cv2.VideoCapture(image_path)
+            
+            # 1. 전체 프레임 수 확인
+            frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            
+            # 2. 중간 프레임 인덱스 계산 (0보다 커야 함)
+            if frame_count > 0:
+                mid_frame_index = frame_count // 2
+                # 3. 해당 위치로 이동
+                cap.set(cv2.CAP_PROP_POS_FRAMES, mid_frame_index)
+            
+            # 4. 프레임 읽기 (이동한 위치의 프레임을 읽음)
+            ret, frame = cap.read()
+            cap.release()
+            
+            if not ret:
+                print(f"[Error] Could not read frame from video: {image_path}")
+                return None
+            
+            # OpenCV(BGR) -> PIL(RGB) 변환
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = Image.fromarray(frame)
+            
+        # 2. 일반 이미지 파일인 경우
+        else:
+            img = Image.open(image_path).convert('RGB')
         
-        # Transform 적용
-        input_tensor = transform(img)
-        return input_tensor.unsqueeze(0) # Batch 차원 추가 (1, C, H, W)
+        # 3. 공통 전처리 로직 (리사이즈 및 Transform)
+        if img is not None:
+            # 학습 코드의 리사이즈 로직 유지 (홀수 해상도 처리)
+            w, h = img.size
+            if w % 2 == 1: w += 1
+            if h % 2 == 1: h += 1
+            img = img.resize((w, h))
+            
+            # Transform 적용
+            input_tensor = transform(img)
+            return input_tensor.unsqueeze(0) # Batch 차원 추가 (1, C, H, W)
+            
     except Exception as e:
         print(f"[Error] Failed to process {image_path}: {e}")
         return None
@@ -77,19 +106,19 @@ def main():
     model = load_model(Config.MODEL_PATH, device)
     transform = get_transform()
 
-    # 2. 이미지 파일 리스트 확보
-    valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.webp', '.jfif')
+    # 2. 파일 리스트 확보
+    # mp4가 이미 포함되어 있었으므로 그대로 둡니다.
+    valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp', '.webp', '.jfif', '.mp4')
     image_files = []
     
-    # 하위 폴더까지 검색할지 여부에 따라 recursive 조정
     raw_files = glob.glob(os.path.join(Config.INPUT_FOLDER, '**', '*'), recursive=True)
     image_files = sorted([f for f in raw_files if f.lower().endswith(valid_extensions)])
 
     if not image_files:
-        print(f"[Warning] No images found in {Config.INPUT_FOLDER}")
+        print(f"[Warning] No files found in {Config.INPUT_FOLDER}")
         return
 
-    print(f"[Info] Found {len(image_files)} images. Starting inference...")
+    print(f"[Info] Found {len(image_files)} files. Starting inference...")
 
     results = []
 
@@ -105,40 +134,33 @@ def main():
             
             # Forward
             output = model(input_tensor)
-            prob = torch.sigmoid(output).item() # 0~1 사이 확률값
+            prob = torch.sigmoid(output).item()
             
-            # Label 결정 (학습 코드 기준: Class 1 = Fake, Class 0 = Real)
-            # 0.5 초과면 Fake(1), 이하면 Real(0)
             pred_label = 1 if prob > 0.5 else 0
             label_str = "Fake" if pred_label == 1 else "Real"
             
-            # 결과 저장
             results.append({
                 'filename': os.path.basename(img_path),
                 'path': img_path,
-                'probability': prob,  # 1(Fake)에 가까운 정도
+                'probability': prob,
                 'prediction': pred_label,
                 'label': label_str
             })
 
     # 4. 결과 출력 및 저장
     df = pd.DataFrame(results)
-    
-    # CSV 저장
     df.to_csv(Config.OUTPUT_CSV, index=False)
     
     print("-" * 50)
     print(f"[Result] Inference complete. Saved to {Config.OUTPUT_CSV}")
     print("-" * 50)
     
-    # 터미널에 상위 10개 결과 출력 (확인용)
     if not df.empty:
         print(df[['filename', 'label', 'probability']].head(10))
 
 if __name__ == "__main__":
-    # 폴더가 없으면 에러가 나므로 미리 체크하거나 생성
     if not os.path.exists(Config.INPUT_FOLDER):
         os.makedirs(Config.INPUT_FOLDER, exist_ok=True)
-        print(f"Created input folder: {Config.INPUT_FOLDER}. Please put images inside.")
+        print(f"Created input folder: {Config.INPUT_FOLDER}. Please put images/videos inside.")
     else:
         main()

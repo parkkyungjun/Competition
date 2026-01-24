@@ -9,13 +9,16 @@ import os
 import glob, sys
 import random
 import numpy as np
+from sklearn.metrics import roc_auc_score
 
 from efficientnet import efficientnetb2_custom
+from effort import DeepfakeEffortModel
 
 from sklearn.metrics import f1_score
  
 from tqdm import tqdm 
 import shutil
+from decord import VideoReader, cpu
 
 def seed_torch(seed=8746):
     random.seed(seed)
@@ -29,138 +32,9 @@ seed = 8746
 seed_torch(seed=seed)
 CROP_SIZE = 512
 
-class Logger(object):
-    def __init__(self, filename="training_log.txt"):
-        self.terminal = sys.stdout
-        self.log = open(filename, "w") # 'w' (덮어쓰기) 또는 'a' (이어쓰기)
-
-    def write(self, message):
-        self.terminal.write(message)
-        self.log.write(message)
-
-    def flush(self):
-        # 이 flush 메소드는 end='\r' 같은 출력이
-        # 실시간으로 반영되도록 보장하는 데 중요합니다.
-        self.terminal.flush()
-        self.log.flush()
-
-# RandomCropAvoidArea 클래스 대신 아래 클래스를 사용합니다.
-class PathAwareRandomCrop(object):
-    def __init__(self, output_size, avoid_br_size, avoid_tr_size):
-        self.output_size = (output_size, output_size) # (h, w)
-        self.avoid_br_size = (avoid_br_size, avoid_br_size) # (h, w)
-        self.avoid_tr_size = (avoid_tr_size, avoid_tr_size) # (h, w)
-        self.avoid_tl_size = (avoid_tr_size, avoid_tr_size) # (h, w)
-
-    def __call__(self, sample):
-        img, filepath = sample 
-        
-        # if 'avoid_bottom_right' in filepath:
-        if 'gemini' in filepath or 'hailuo' in filepath:
-            img = self._perform_br_avoid_crop(img)
-        elif 'avoid_top_right' in filepath:
-            img = self._perform_tr_avoid_crop(img)
-        elif 'avoid_left_top_right_bottom' in filepath:
-            img = self._perform_br_tl_avoid_crop(img)
-        elif 'center_crop' in filepath:
-            img = transforms.CenterCrop(self.output_size)(img)
-        else:
-            w, h = img.size
-            th, tw = self.output_size
-            
-            if w < tw or h < th:
-                img = self._resize_and_centercrop(img)
-            else:
-                img = transforms.RandomCrop(self.output_size)(img)
-
-        return img
-
-    def _resize_and_centercrop(self, img):
-        """크롭 크기보다 이미지가 작을 때 공통 처리"""
-        img = transforms.Resize(self.output_size)(img)
-        return transforms.CenterCrop(self.output_size)(img)
-
-    def _perform_br_avoid_crop(self, img):
-        """기존 로직: 우측 하단 회피"""
-        w, h = img.size
-        th, tw = self.output_size
-        ah, aw = self.avoid_br_size
-
-        if w < tw or h < th:
-            return self._resize_and_centercrop(img)
-
-        avoid_x_start = w - aw
-        avoid_y_start = h - ah
-
-        for _ in range(10):
-            i = random.randint(0, h - th) # top
-            j = random.randint(0, w - tw) # left
-            
-            # 겹치지 않는 조건
-            if (j + tw <= avoid_x_start) or (i + th <= avoid_y_start):
-                return transforms.functional.crop(img, i, j, th, tw)
-        
-        return transforms.RandomCrop(self.output_size)(img) # 10번 실패 시
-    
-    def _perform_tr_avoid_crop(self, img):
-        """새 로직: 우측 상단 회피"""
-        w, h = img.size
-        th, tw = self.output_size
-        ah, aw = self.avoid_tr_size
-
-        if w < tw or h < th:
-            return self._resize_and_centercrop(img)
-
-        avoid_x_start = w - aw
-        avoid_y_start = 0 # Top
-
-        for _ in range(10):
-            i = random.randint(0, h - th) # top
-            j = random.randint(0, w - tw) # left
-
-            if (j + tw <= avoid_x_start) or (i >= (avoid_y_start + ah)):
-                return transforms.functional.crop(img, i, j, th, tw)
-
-        return transforms.RandomCrop(self.output_size)(img) # 10번 실패 시
-    
-    def _perform_br_tl_avoid_crop(self, img):
-            """추가된 로직: 우측 하단(BR) 및 좌측 상단(TL) 동시 회피"""
-            w, h = img.size
-            th, tw = self.output_size
-            br_ah, br_aw = self.avoid_br_size
-            tl_ah, tl_aw = self.avoid_tl_size
-
-            if w < tw or h < th:
-                return self._resize_and_centercrop(img)
-
-            # BR 회피 영역 (시작 x, y)
-            br_avoid_x_start = w - br_aw
-            br_avoid_y_start = h - br_ah
-            
-            # TL 회피 영역 (끝 x, y)
-            tl_avoid_x_end = tl_aw
-            tl_avoid_y_end = tl_ah
-
-            for _ in range(10):
-                i = random.randint(0, h - th) # top
-                j = random.randint(0, w - tw) # left
-
-                # 1. BR과 겹치는지 검사
-                overlaps_with_br = (j + tw > br_avoid_x_start) and (i + th > br_avoid_y_start)
-                
-                # 2. TL과 겹치는지 검사
-                overlaps_with_tl = (j < tl_avoid_x_end) and (i < tl_avoid_y_end)
-
-                # 3. 둘 다 겹치지 않는 경우에만 크롭 반환
-                if not overlaps_with_br and not overlaps_with_tl:
-                    return transforms.functional.crop(img, i, j, th, tw)
-
-            return transforms.RandomCrop(self.output_size)(img) # 10번 실패 시
-
 # --- 2. 커스텀 Dataset ---
 class MixedContentDataset(Dataset):
-    def __init__(self, class1_files, class0_files, crop_transform, transform):
-        self.crop_transform = crop_transform
+    def __init__(self, class1_files, class0_files, transform):
         self.transform = transform
         self.samples = []
         
@@ -175,33 +49,26 @@ class MixedContentDataset(Dataset):
     def __getitem__(self, idx):
         filepath, label = self.samples[idx]
 
-        # if filepath.endswith(('.mp4', '.avi', '.mkv')):
-        #     cap = cv2.VideoCapture(filepath)
-        #     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        if filepath.endswith(('.mp4', '.avi', '.mkv')):
+            vr = VideoReader(filepath, ctx=cpu(0))
             
-        #     if frame_count > 0:
-        #         random_idx = random.randint(0, frame_count - 1)
-        #         cap.set(cv2.CAP_PROP_POS_FRAMES, random_idx)
+            random_idx = random.randint(0, len(vr) - 1)
+
+            frame = vr[random_idx]
+            img = frame.asnumpy()
             
-        #     ret, frame = cap.read()
-        #     cap.release()
+            img = Image.fromarray(img)
+            img = self.transform(img)
+
+        else:
+            img = Image.open(filepath).convert('RGB')
             
-        #     if not ret:
-        #         raise Exception(f"Failed to read frame at {random_idx}: {filepath}")
-            
-        #     img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        #     img = Image.fromarray(img)
-            
-        # else:
-        img = Image.open(filepath).convert('RGB')
-        
-        w, h = img.size
-        if w % 2 == 1: w += 1
-        if h % 2 == 1: h += 1
-            
-        img = img.resize((w, h))
-        # img = self.crop_transform((img, filepath))
-        img = self.transform(img)
+            w, h = img.size
+            if w % 2 == 1: w += 1
+            if h % 2 == 1: h += 1
+                
+            img = img.resize((w, h))
+            img = self.transform(img)
         
         return img, torch.tensor(label, dtype=torch.float32), filepath
 
@@ -256,48 +123,44 @@ class BalancedBatchSampler(torch.utils.data.Sampler):
 # --- 3. 데이터 준비 및 분할 ---
 def get_data_loaders(batch_size):
     # 이미지/비디오 확장자 필터
-    valid_extensions = ('.jpg', '.jpeg', '.png', '.bmp', 'webp', 'jfif')
+    valid_extensions_train = ('.jpg', '.jpeg', '.png', '.bmp', 'webp', 'jfif', '.mp4')
     
     # --- 클래스 1 파일 로드 ---
-    path_class1 = 'train/fake'
-    all_files_c1 = glob.glob(os.path.join(path_class1, '**', '*'), recursive=True)
-    all_files_c1 = [f for f in all_files_c1 if f.lower().endswith(valid_extensions)]
-    
+    path_class1 = 'processed_dataset_384_padded/fake'
+    train_c1 = glob.glob(os.path.join(path_class1, '**', '*'), recursive=True)
+    train_c1 = [f for f in train_c1 if f.lower().endswith(valid_extensions_train)]
+     
     # --- 클래스 0 파일 로드 ---
     path_class0_list = []
-    path_class0_list.append(os.path.expanduser('~/.cache/kagglehub/datasets/sautkin/imagenet1k1/versions/2'))
-    path_class0_list.append('train/real/videezy')
-    path_class0_list.append('train/real/youtube')
+    # path_class0_list.append(os.path.expanduser('~/.cache/kagglehub/datasets/sautkin/imagenet1k1/versions/2'))
+    # path_class0_list.append('train/real/videezy')
+    # path_class0_list.append('train/real/youtube')
+    path_class0_list.append('processed_dataset_384_padded/real')
     
-    all_files_c0 = []
-    val_c0 = []
+    train_c0 = []
     
-    # ... (기존 파일 로딩 로직 유지) ...
     for i in path_class0_list:
         temp_files = glob.glob(os.path.join(i, '**', '*'), recursive=True)
-        valid_files = [f for f in temp_files if f.lower().endswith(valid_extensions)]
-        sample_count = min(1000, len(valid_files))
+        valid_files = [f for f in temp_files if f.lower().endswith(valid_extensions_train)]
+        sample_count = min(500, len(valid_files))
         sampled_files = random.sample(valid_files, sample_count)
-        all_files_c0 += sampled_files
-        if len(valid_files) < 1000:
-            val_c0 += sampled_files
-            
-    print(f"학습 클래스 1 파일 수: {len(all_files_c1)}")
-    print(f"학습 클래스 0 파일 수: {len(all_files_c0)}")
-            
-    val_files_c1 = all_files_c1 # (참고: 검증셋 로직은 사용자 의도에 맞게 유지)
-    val_files_c0 = val_c0
+        train_c0 += sampled_files
+    
+    print(len(train_c1), len(train_c0))
 
-    crop_transform = PathAwareRandomCrop(output_size=200, avoid_br_size=200, avoid_tr_size=200)
+    val_c1 = glob.glob('valid/fake/*')
+    val_c0 = glob.glob('valid/real/*')
+
+    # crop_transform = PathAwareRandomCrop(output_size=200, avoid_br_size=200, avoid_tr_size=200)
 
     transform = transforms.Compose([
-        transforms.CenterCrop(CROP_SIZE),
+        transforms.Resize((CROP_SIZE, CROP_SIZE)),
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
-
-    train_dataset = MixedContentDataset(all_files_c1, all_files_c0, crop_transform, transform)
-    val_dataset = MixedContentDataset(val_files_c1, val_files_c0, crop_transform, transform)
+    
+    train_dataset = MixedContentDataset(train_c1, train_c0, transform)
+    val_dataset = MixedContentDataset(val_c1, val_c0, transform)
     
     # [핵심 변경] BalancedBatchSampler 생성
     train_batch_sampler = BalancedBatchSampler(train_dataset, batch_size=batch_size)
@@ -323,6 +186,7 @@ def get_data_loaders(batch_size):
     )
     
     return train_loader, val_loader
+
 def validate(model, loader, criterion, device, save_dir="wrong_samples"):
     model.eval()
     total_loss = 0
@@ -332,10 +196,11 @@ def validate(model, loader, criterion, device, save_dir="wrong_samples"):
     total_c0 = 0
     correct_c1 = 0
     total_c1 = 0
+    
     all_labels = []
-    all_preds = []
+    all_probs = []
 
-    # 오답 저장 폴더 생성
+    # 1. 오답 저장 폴더 생성 (주석 해제)
     # if not os.path.exists(save_dir):
     #     os.makedirs(save_dir)
     #     print(f"Created directory for wrong samples: {save_dir}")
@@ -356,26 +221,31 @@ def validate(model, loader, criterion, device, save_dir="wrong_samples"):
             correct += (preds == labels).sum().item()
             total += labels.size(0)
 
-            # 오답 처리 및 저장
+            # 2. 오답 처리 및 파일 저장 로직 (주석 해제 및 복구)
+            # 배치 내의 각 샘플을 순회하며 틀린 것만 저장
             # for i in range(labels.size(0)): 
             #     is_correct = (preds[i] == labels[i]).item()
-                # if not is_correct:
-                #     pred_score = probs[i].item()
-                #     true_label = labels[i].item()
-                #     full_path = names[i]
-                #     filename = os.path.basename(full_path)
+                
+            #     if not is_correct:
+            #         pred_score = probs[i].item()
+            #         true_label = labels[i].item()
+            #         full_path = names[i] # Dataset에서 리턴한 파일 경로
+            #         filename = os.path.basename(full_path)
                     
-                    # 예: Pred_0.91_Label_0_image.jpg
-                    # save_name = f"Pred_{pred_score:.4f}_Label_{int(true_label)}_{filename}"
-                    # save_path = os.path.join(save_dir, save_name)
+            #         # 파일명 예시: Pred_0.9100_Label_0_image.jpg
+            #         # (모델은 0.91(Fake)로 봤는데, 실제는 0(Real)인 경우 등)
+            #         save_name = f"Pred_{pred_score:.4f}_Label_{int(true_label)}_{filename}"
+            #         save_path = os.path.join(save_dir, save_name)
                     
-                    # try:
-                    #     shutil.copy(full_path, save_path)
-                    #     print(f"  [WRONG - SAVED] {save_name}")
-                    # except Exception as e:
-                    #     print(f"  [WRONG - SAVE FAILED] {filename}: {e}")
+            #         try:
+            #             # 원본 파일을 해당 폴더로 복사
+            #             shutil.copy(full_path, save_path)
+            #             # 너무 많이 출력되면 로그가 지저분하므로 필요하면 print 주석 처리
+            #             # print(f"  [WRONG] Saved: {save_name}")
+            #         except Exception as e:
+            #             print(f"  [WRONG - SAVE FAILED] {filename}: {e}")
 
-            # 클래스별 정확도
+            # 클래스별 정확도 집계
             c0_mask = (labels == 0)
             total_c0 += c0_mask.sum().item()
             correct_c0 += ((preds == 0) & c0_mask).sum().item()
@@ -384,26 +254,27 @@ def validate(model, loader, criterion, device, save_dir="wrong_samples"):
             total_c1 += c1_mask.sum().item()
             correct_c1 += ((preds == 1) & c1_mask).sum().item()
 
+            # AUROC용 데이터 수집
             all_labels.extend(labels.cpu().numpy())
-            all_preds.extend(preds.cpu().numpy())
+            all_probs.extend(probs.cpu().numpy())
 
     avg_loss = total_loss / len(loader)
     accuracy = (correct / total) * 100
     acc_c0 = (correct_c0 / total_c0) * 100 if total_c0 > 0 else 0
     acc_c1 = (correct_c1 / total_c1) * 100 if total_c1 > 0 else 0
     
-    macro_f1 = f1_score(
-        np.array(all_labels).squeeze(),
-        np.array(all_preds).squeeze(),
-        average='macro', 
-        zero_division=0
-    )
+    # AUROC 계산
+    try:
+        auroc = roc_auc_score(
+            np.array(all_labels).squeeze(),
+            np.array(all_probs).squeeze()
+        )
+    except ValueError:
+        auroc = 0.0
     
-    print(f"  Val Avg Loss: {avg_loss:.4f}, Val Acc: {accuracy:.2f}%, C0: {acc_c0:.2f}%, C1: {acc_c1:.2f}%, F1: {macro_f1:.4f}")
+    print(f"  Val Loss: {avg_loss:.4f}, Acc: {accuracy:.2f}%, AUROC: {auroc:.4f} (Real: {acc_c0:.1f}%, Fake: {acc_c1:.1f}%)")
     
-    return avg_loss, accuracy, macro_f1, acc_c0, acc_c1
-
-
+    return avg_loss, accuracy, auroc, acc_c0, acc_c1
 # --- [추가됨] 4. 학습 함수 (AMP 적용) ---
 def train_one_epoch(model, loader, criterion, optimizer, scaler, device, epoch):
     model.train()
@@ -466,16 +337,20 @@ if __name__ == "__main__":
     
     # 2. 데이터 로드
     print("\n[Loading Data...]")
-    # get_data_loaders 함수 내부의 BATCH_SIZE 변수를 전역 변수나 인자로 받도록 수정하는 것이 좋으나,
-    # 현재 코드 구조상 get_data_loaders 내부에서 BATCH_SIZE를 참조하므로 
-    # 위에서 정의한 BATCH_SIZE가 get_data_loaders 호출 시 반영되도록 주의해주세요.
-    # (제공해주신 코드의 get_data_loaders는 전역 변수 BATCH_SIZE를 참조합니다.)
+
     train_loader, val_loader = get_data_loaders(BATCH_SIZE)
     print("Data loading complete.")
 
     # 3. 모델 초기화
     print("\n[Initializing Model...]")
-    model = efficientnetb2_custom()
+    # model = efficientnetb2_custom()
+    import torch
+    import torch.nn as nn
+    from torch.nn import functional as F
+
+    from torchvision.models import efficientnet_b2, EfficientNet, EfficientNet_B2_Weights
+    # model = efficientnet_b2(weights=EfficientNet_B2_Weights.IMAGENET1K_V1, num_classes=1)
+    model = DeepfakeEffortModel()
     
     model.to(device)
 

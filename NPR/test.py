@@ -1,44 +1,35 @@
-import os
-from pathlib import Path
 from PIL import Image
-from tqdm import tqdm
+import numpy as np
+import cv2  # OpenCV 추가
 
-def delete_small_images(root_dir):
-    root_path = Path(os.path.expanduser(root_dir))
+def preprocess_image(image_path):
+    img = None
     
-    # 이미지 확장자 정의
-    valid_extensions = {'.jpg', '.jpeg', '.png', '.ppm', '.bmp', '.pgm', '.tif', '.tiff', '.webp'}
+    # 1. MP4 파일인 경우 첫 프레임 추출
+    if image_path.lower().endswith('.mp4'):
+        cap = cv2.VideoCapture(image_path)
+        ret, frame = cap.read() # 첫 프레임 읽기
+        cap.release()
+        
+        if not ret:
+            print(f"[Error] Could not read frame from video: {image_path}")
+            return None
+        
+        # OpenCV(BGR) -> PIL(RGB) 변환
+        frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        img = Image.fromarray(frame)
+        
+    # 2. 일반 이미지 파일인 경우
+    else:
+        img = Image.open(image_path).convert('RGB')
+
+    print(img.size)
+    return np.array(img)
+
     
-    deleted_count = 0
-    error_count = 0
-    
-    # 모든 이미지 파일 리스트 확보
-    all_files = [f for f in root_path.rglob('*') if f.suffix.lower() in valid_extensions]
-    print(f"총 {len(all_files)}개의 이미지를 검사합니다...")
 
-    for img_path in tqdm(all_files):
-        try:
-            # 이미지 헤더만 읽어서 사이즈 확인
-            with Image.open(img_path) as img:
-                w, h = img.size
-            
-            # 한 쪽이라도 512 미만인 경우 삭제
-            if w < 512 or h < 512:
-                img_path.unlink() # 파일 삭제
-                deleted_count += 1
-                
-        except Exception as e:
-            # 파일이 손상되었거나 접근 권한이 없는 경우
-            error_count += 1
-            continue
+img = preprocess_image('sorted_groups/group_000/TEST_392.mp4')
+img2 = preprocess_image('sorted_groups/group_000/TEST_448.png')
 
-    print("\n" + "="*30)
-    print(f"작업 완료 (경로: {root_dir})")
-    print(f"- 삭제된 이미지: {deleted_count}개")
-    if error_count > 0:
-        print(f"- 처리 중 오류 발생: {error_count}개")
-    print("="*30)
-
-# 실행 (경로 확인 필수!)
-target_path = '~/.cache/kagglehub/datasets/sautkin/imagenet1k1/versions/2'
-delete_small_images(target_path)
+cv2.imwrite('out1.png', cv2.cvtColor(img2, cv2.COLOR_RGB2BGR))
+print(np.sum(img == img2) / (img.shape[0] * img.shape[1] * 3))
